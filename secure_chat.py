@@ -3,8 +3,13 @@ import base64
 import json
 import socket
 import threading
+import time
 
-from actor import Actor
+from actor import Actor, ReplayError
+
+
+MAX_PACKET_BYTES = 1_048_576
+HANDSHAKE_TIMEOUT_SECONDS = 30
 
 
 def send_packet(connection, send_lock, packet):
@@ -14,14 +19,69 @@ def send_packet(connection, send_lock, packet):
 
 
 def receive_packet(reader):
-    line = reader.readline()
+    line = reader.readline(MAX_PACKET_BYTES + 1)
     if not line:
         return None
+    if len(line) > MAX_PACKET_BYTES or not line.endswith(b"\n"):
+        raise ValueError("packet is too large or is missing its newline delimiter")
 
     packet = json.loads(line.decode("utf-8"))
     if not isinstance(packet, dict):
         raise ValueError("Received a packet that is not a JSON object")
     return packet
+
+
+def wait_for_handshake(secure_session, receiver_done):
+    deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
+    while not secure_session.is_set():
+        if receiver_done.is_set():
+            print("Handshake failed: the other process disconnected.")
+            return False
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("Handshake timed out.")
+            return False
+        secure_session.wait(timeout=min(0.1, remaining))
+    return True
+
+
+def receive_encrypted_message(packet, peer_name, local_name, actor, secure_session):
+    if not secure_session.is_set():
+        print("\nRejected encrypted message: secure session is not established.")
+        return
+
+    try:
+        nonce = base64.b64decode(packet["nonce"], validate=True)
+        ciphertext = base64.b64decode(packet["ciphertext"], validate=True)
+        print(
+            f"\n[{peer_name}] ciphertext received: "
+            f"nonce={nonce.hex()} data={ciphertext.hex()}"
+        )
+        plaintext = actor.decrypt_message_aesgcm(nonce, ciphertext)
+    except ReplayError as error:
+        print(f"\nRejected encrypted message: {error}")
+        print(f"[{local_name}] ", end="", flush=True)
+        return
+    except (KeyError, TypeError, ValueError) as error:
+        print(f"\nRejected invalid encrypted message: {error}")
+        print(f"[{local_name}] ", end="", flush=True)
+        return
+
+    if plaintext is None:
+        print("\nMessage rejected: authentication failed.")
+        print(f"[{local_name}] ", end="", flush=True)
+        return
+
+    try:
+        message_text = plaintext.decode("utf-8")
+    except UnicodeDecodeError:
+        print("\nMessage rejected: authenticated plaintext is not valid UTF-8.")
+        print(f"[{local_name}] ", end="", flush=True)
+        return
+
+    print(f"\n[{peer_name}] {message_text}")
+    print(f"[{local_name}] ", end="", flush=True)
 
 
 def open_connection(args):
@@ -36,7 +96,11 @@ def open_connection(args):
             return connection
 
     connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    connection.connect((args.host, args.port))
+    try:
+        connection.connect((args.host, args.port))
+    except OSError:
+        connection.close()
+        raise
     print(f"Connected to {args.host}:{args.port}")
     return connection
 
@@ -50,6 +114,7 @@ def receive_messages(
     actor,
     secure_session,
     initiation_started,
+    receiver_done,
     mode,
 ):
     try:
@@ -62,22 +127,9 @@ def receive_messages(
             if packet.get("type") == "message":
                 print("\nRejected unencrypted chat message.")
             elif packet.get("type") == "encrypted_message":
-                if not secure_session.is_set():
-                    print("\nRejected encrypted message: secure session is not established.")
-                    continue
-                try:
-                    nonce = base64.b64decode(packet["nonce"], validate=True)
-                    ciphertext = base64.b64decode(packet["ciphertext"], validate=True)
-                    print(
-                        f"\n[{peer_name}] ciphertext received: "
-                        f"nonce={nonce.hex()} data={ciphertext.hex()}"
-                    )
-                    plaintext = actor.decrypt_message_aesgcm(nonce, ciphertext)
-                    if plaintext is not None:
-                        print(f"\n[{peer_name}] {plaintext.decode('utf-8')}")
-                        print(f"[{local_name}] ", end="", flush=True)
-                except (KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
-                    print(f"\nRejected invalid encrypted message: {error}")
+                receive_encrypted_message(
+                    packet, peer_name, local_name, actor, secure_session
+                )
             elif packet.get("type") == "key_offer":
                 # If both sides type /init at once, the TCP connector wins the tie.
                 # Its offer is the one both sides will use to establish the key.
@@ -104,6 +156,9 @@ def receive_messages(
                     print(f"\nCould not process public-key offer: {error}")
                     return
             elif packet.get("type") == "session_key":
+                if not initiation_started.is_set() or secure_session.is_set():
+                    print("\nIgnoring unsolicited session-key packet.")
+                    continue
                 try:
                     encrypted_key = base64.b64decode(
                         packet["encrypted_key"], validate=True
@@ -121,6 +176,8 @@ def receive_messages(
                 print("Received an unknown packet.")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         print(f"Receive error: {error}")
+    finally:
+        receiver_done.set()
 
 
 def run_chat(args):
@@ -131,6 +188,7 @@ def run_chat(args):
     actor = Actor(direction_id)
     secure_session = threading.Event()
     initiation_started = threading.Event()
+    receiver_done = threading.Event()
 
     try:
         send_packet(connection, send_lock, {"type": "hello", "name": args.name})
@@ -140,6 +198,10 @@ def run_chat(args):
 
         peer_name = hello.get("name", "Unknown participant")
         print(f"Connected with {peer_name}.")
+        print(
+            "Notice: exchanged public keys are not authenticated; "
+            "this demo does not prevent an active man-in-the-middle attack."
+        )
         print("Type /init to establish the secure session, or /quit to exit.")
 
         receiver = threading.Thread(
@@ -153,6 +215,7 @@ def run_chat(args):
                 actor,
                 secure_session,
                 initiation_started,
+                receiver_done,
                 args.mode,
             ),
             daemon=True,
@@ -183,11 +246,24 @@ def run_chat(args):
                         {"type": "key_offer", "public_key": actor.export_public_key()},
                     )
                     print("Public key sent; waiting for the encrypted session key...")
-                    secure_session.wait()
+                    if not wait_for_handshake(secure_session, receiver_done):
+                        break
                 except (OSError, ValueError) as error:
                     print(f"Handshake failed: {error}")
                     break
                 continue
+
+            corruption_test = False
+            if text == "/corrupted":
+                print("Usage: /corrupted <message>")
+                continue
+            if text.startswith("/corrupted "):
+                corruption_test = True
+                text = text[len("/corrupted "):]
+                if not text:
+                    print("Usage: /corrupted <message>")
+                    continue
+
             if text:
                 if not secure_session.is_set():
                     print("Establish the secure session with /init before chatting.")
@@ -198,7 +274,16 @@ def run_chat(args):
                     nonce,
                     text.encode("utf-8"),
                 )
-                print(f"[{args.name}] ciphertext sent: nonce={nonce.hex()} data={ciphertext.hex()}")
+                if corruption_test:
+                    damaged_ciphertext = bytearray(ciphertext)
+                    damaged_ciphertext[0] ^= 0x01
+                    ciphertext = bytes(damaged_ciphertext)
+
+                label = "corrupted ciphertext sent" if corruption_test else "ciphertext sent"
+                print(
+                    f"[{args.name}] {label}: "
+                    f"nonce={nonce.hex()} data={ciphertext.hex()}"
+                )
                 send_packet(
                     connection,
                     send_lock,
@@ -220,7 +305,7 @@ def run_chat(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Local chat with an RSA session-key handshake (workshop step 3)"
+        description="Local chat with an RSA handshake and AES-GCM messages (workshop steps 3-5)"
     )
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
