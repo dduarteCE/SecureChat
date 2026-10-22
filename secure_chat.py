@@ -4,7 +4,7 @@ import json
 import socket
 import threading
 
-from RSA import Actor
+from actor import Actor
 
 
 def send_packet(connection, send_lock, packet):
@@ -44,6 +44,7 @@ def open_connection(args):
 def receive_messages(
     reader,
     peer_name,
+    local_name,
     connection,
     send_lock,
     actor,
@@ -59,10 +60,24 @@ def receive_messages(
                 return
 
             if packet.get("type") == "message":
+                print("\nRejected unencrypted chat message.")
+            elif packet.get("type") == "encrypted_message":
                 if not secure_session.is_set():
-                    print("\nRejected chat message: secure session is not established.")
-                else:
-                    print(f"\n[{peer_name}] {packet.get('text', '')}")
+                    print("\nRejected encrypted message: secure session is not established.")
+                    continue
+                try:
+                    nonce = base64.b64decode(packet["nonce"], validate=True)
+                    ciphertext = base64.b64decode(packet["ciphertext"], validate=True)
+                    print(
+                        f"\n[{peer_name}] ciphertext received: "
+                        f"nonce={nonce.hex()} data={ciphertext.hex()}"
+                    )
+                    plaintext = actor.decrypt_message_aesgcm(nonce, ciphertext)
+                    if plaintext is not None:
+                        print(f"\n[{peer_name}] {plaintext.decode('utf-8')}")
+                        print(f"[{local_name}] ", end="", flush=True)
+                except (KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
+                    print(f"\nRejected invalid encrypted message: {error}")
             elif packet.get("type") == "key_offer":
                 # If both sides type /init at once, the TCP connector wins the tie.
                 # Its offer is the one both sides will use to establish the key.
@@ -112,7 +127,8 @@ def run_chat(args):
     connection = open_connection(args)
     reader = connection.makefile("rb")
     send_lock = threading.Lock()
-    actor = Actor()
+    direction_id = 0 if args.mode == "connect" else 1
+    actor = Actor(direction_id)
     secure_session = threading.Event()
     initiation_started = threading.Event()
 
@@ -131,6 +147,7 @@ def run_chat(args):
             args=(
                 reader,
                 peer_name,
+                args.name,
                 connection,
                 send_lock,
                 actor,
@@ -175,10 +192,21 @@ def run_chat(args):
                 if not secure_session.is_set():
                     print("Establish the secure session with /init before chatting.")
                     continue
+                print(f"[{args.name}] plaintext local: {text}")
+                nonce = actor.generate_nonce()
+                ciphertext = actor.encrypt_message_aesgcm(
+                    nonce,
+                    text.encode("utf-8"),
+                )
+                print(f"[{args.name}] ciphertext sent: nonce={nonce.hex()} data={ciphertext.hex()}")
                 send_packet(
                     connection,
                     send_lock,
-                    {"type": "message", "text": text},
+                    {
+                        "type": "encrypted_message",
+                        "nonce": base64.b64encode(nonce).decode("ascii"),
+                        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+                    },
                 )
     finally:
         try:
